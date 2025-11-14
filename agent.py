@@ -1,8 +1,8 @@
 # agent.py
 # GenAI Data Processing & Automation Agent
-# VERSION: Stateful "In-Memory" (with JSON State Fix)
-# This agent holds the dataframe as a JSON string in its state
-# to make it serializable for the checkpointer.
+# VERSION: Stateful (with JSON Fix) + Validation Loop
+# This agent holds the dataframe as a JSON string in its state,
+# processes it, and then validates the result against the user's goal.
 
 import os
 import json
@@ -37,7 +37,7 @@ if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY missing in .env")
 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
+    model="gemini-2.5-pro",  # <--- Corrected to the model we know works
     google_api_key=GOOGLE_API_KEY,
     temperature=0.0,
     max_output_tokens=8192,
@@ -52,28 +52,40 @@ class AgentState(TypedDict, total=False):
     'df_json' will hold our dataframe as a JSON string.
     """
     file_path: str
-    df_json: str  # <--- MODIFIED: We store the df as a JSON string
+    df_json: str  # We store the df as a JSON string
     user_prompt: str
     analysis_report: str
     plan: str
     generated_code: str
     execution_log: List[str]
     error: Optional[str]
-    feedback: Optional[str]
+    feedback: Optional[str]  # Manual feedback from a human user
+    validation_feedback: Optional[str]  # <--- NEW: Feedback from the AI's self-validation
     retries: int
     max_retries: int
 
 # ----------------------------------------------------------------------
-# 4. LLM Output Schema
+# 4. LLM Output Schemas
 # ----------------------------------------------------------------------
 class PlanAndCode(BaseModel):
     """
-    This class forces the LLM to return JSON in this exact structure.
+    Forces the LLM to return a plan and the code to execute.
     """
     plan: str = Field(description="A concise, bullet-point plan of the data processing steps to be taken.")
     python_code: str = Field(description="A single, executable Python code block to transform the pandas DataFrame named 'df'.")
 
+# This new schema is for our validation node
+class ValidationResult(BaseModel):
+    """
+    The result of the AI's self-validation step.
+    """
+    satisfied: bool = Field(description="Boolean flag, True if the dataframe meets all user requirements, False otherwise.")
+    feedback: Optional[str] = Field(description="If not satisfied, a concise explanation of what is wrong or missing. This will be used to re-plan.")
+
+# We now have two structured LLM callers
 structured_llm = llm.with_structured_output(PlanAndCode)
+validation_llm = llm.with_structured_output(ValidationResult)
+
 
 # ----------------------------------------------------------------------
 # 5. Agent Nodes
@@ -85,19 +97,17 @@ def data_preview_node(state: AgentState) -> Dict[str, Any]:
     """
     print("\n--- 🔬 NODE: Data Preview ---")
     try:
-        # Calls the function from utils.py
         result = utils.combine_analysis_outputs(state["file_path"])
         if "error" in result:
             raise ValueError(result["error"])
         
-        # --- MODIFIED: Convert DataFrame to JSON string ---
         df = result["dataframe"]
         df_json = df.to_json(orient='split')
         
         print(f"✓ Analysis complete. Report generated. DF loaded and serialized (Shape: {df.shape})")
         return {
             "analysis_report": result["quality_report"],
-            "df_json": df_json,  # <--- MODIFIED: Save the df_json to the state
+            "df_json": df_json,
             "retries": 0,
             "max_retries": 3,
             "execution_log": [],
@@ -110,40 +120,51 @@ def data_preview_node(state: AgentState) -> Dict[str, Any]:
 
 def plan_generation_node(state: AgentState) -> Dict[str, Any]:
     """
-    Node 2: The "Brain". (This node is unchanged)
+    Node 2: The "Brain". Now handles code errors AND validation feedback.
     """
     print("\n--- 🧠 NODE: Plan Generation ---")
     
+    # --- UPDATED SYSTEM PROMPT ---
     system = """
 You are an expert Data Engineer AI Agent. Your job is to write a Python script 
-to clean and process a dataset based on a user's request and a data analysis report.
+to clean and process a dataset based on a user's request, a data analysis report,
+and (if provided) critical feedback on your previous attempt.
 
 **Rules:**
-1.  You will be given a data analysis report and a user goal.
-2.  You MUST generate a JSON object with "plan" and "python_code" keys.
-3.  The Python code will be executed in an environment where the dataframe 
+1.  You MUST generate a JSON object with "plan" and "python_code" keys.
+2.  The Python code will be executed in an environment where the dataframe 
     is already loaded into a variable named `df`.
-4.  Your code MUST NOT include data loading (e.g., `pd.read_csv`) or data 
-    saving (e.g., `df.to_csv`). It must only contain the transformation logic.
-5.  The code MUST be a single, executable block. Import any libraries you need
-    (e.g., `import numpy as np`, `from sklearn.preprocessing import ...`).
-6.  Always be safe: use `df.get('col_name')` instead of `df['col_name']` to avoid
-    KeyErrors. Use `pd.to_numeric(..., errors='coerce')` for safe conversion.
-7.  You can call functions from the `utils.py` library, like `utils.parse_indian_number()`.
-8.  If you are correcting an error, analyze the error message and the failed
-    code, then generate a new, corrected `python_code` and `plan`.
+3.  Your code MUST NOT include data loading (e.g., `pd.read_csv`) or data 
+    saving (e.g., `df.to_csv`).
+4.  Import any libraries you need (e.g., `import numpy as np`).
+5.  Always be safe: use `df.get('col_name')`, `pd.to_numeric(..., errors='coerce')`.
+6.  If you are correcting an error or validation feedback, prioritize fixing it.
+7.  **CRITICAL RULE:** Before using any `.str` accessor on a column, you
+    MUST first convert it to string and fill NaNs to prevent 'AttributeError'.
+    **Correct:** `df['col_name'] = df['col_name'].astype(str).fillna('Unknown').str.strip()`
+    **Incorrect:** `df['col_name'] = df['col_name'].str.strip()`
 """
     context = f"**Data Analysis Report:**\n{state.get('analysis_report', 'N/A')}\n\n**User's Goal:**\n{state['user_prompt']}"
 
+    # --- This logic is correct ---
     if state.get("error"):
-        print("   ...addressing previous error")
+        print("   ...addressing previous EXECUTION ERROR")
         log = state.get("execution_log", [])
-        context += f"\n\n**CRITICAL: The previous attempt failed.**\n**Error:**\n{state['error']}\n**Failed Code:**\n{state.get('generated_code', 'N/A')}\n**Execution Log:**\n{log[-1] if log else 'N/A'}\n\nPlease generate a new plan and corrected python_code."
+        context += f"\n\n**CRITICAL: The previous code FAILED TO RUN.**\n**Error:**\n{state['error']}\n**Failed Code:**\n{state.get('generated_code', 'N/A')}\n**Execution Log:**\n{log[-1] if log else 'N/A'}\n\nPlease generate a new plan and corrected python_code to fix this error."
+    
+    elif state.get("validation_feedback"):
+        print("   ...addressing previous VALIDATION FEEDBACK")
+        context += f"\n\n**CRITICAL: The previous run was LOGICALLY INCORRECT.**\n**Validation Feedback:**\n{state['validation_feedback']}\n\nPlease generate a new plan and code to fix this logical error. This is a high-priority correction."
 
     try:
         resp = structured_llm.invoke([SystemMessage(content=system), HumanMessage(content=context)])
         print(f"✓ Plan generated (Step 1: {resp.plan.splitlines()[0]}...)")
-        return { "plan": resp.plan, "generated_code": resp.python_code, "error": None }
+        return { 
+            "plan": resp.plan, 
+            "generated_code": resp.python_code, 
+            "error": None,
+            "validation_feedback": None # Clear old feedback
+        }
     except Exception as e:
         print(f"✗ Error in Plan Node (LLM failed): {e}")
         return {"error": f"LLM failed: {e}"}
@@ -151,10 +172,8 @@ to clean and process a dataset based on a user's request and a data analysis rep
 
 def code_execution_node(state: AgentState) -> Dict[str, Any]:
     """
-    Node 3: The "Hands".
-    1. Deserializes the DataFrame from the state's JSON string.
-    2. Executes the LLM's code on the in-memory DataFrame.
-    3. Serializes the modified DataFrame back into a JSON string for the state.
+    Node 3: The "Hands". Deserializes, executes code, serializes.
+    (This node is unchanged)
     """
     print("\n--- 💻 NODE: Code Execution (In-Memory w/ JSON) ---")
     code = state.get("generated_code")
@@ -163,21 +182,16 @@ def code_execution_node(state: AgentState) -> Dict[str, Any]:
     if not code or not df_json:
         return {"error": "Missing generated_code or df_json in state."}
     
-    # --- MODIFIED: Deserialize DataFrame from JSON string ---
     try:
         df_to_process = pd.read_json(io.StringIO(df_json), orient='split')
         print(f"   ...DataFrame deserialized from state. Shape: {df_to_process.shape}")
     except Exception as e:
         return {"error": f"Failed to deserialize DataFrame from state: {e}"}
 
-    # Create the execution scope ("sandbox")
     local_scope = {
         "df": df_to_process,
-        "pd": pd,
-        "np": np,
-        "re": re,
-        "utils": utils,
-        "parse_indian_number": utils.parse_indian_number
+        "pd": pd, "np": np, "re": re,
+        "utils": utils, "parse_indian_number": utils.parse_indian_number
     }
     
     old_stdout = sys.stdout
@@ -185,21 +199,16 @@ def code_execution_node(state: AgentState) -> Dict[str, Any]:
     log_output = ""
     
     try:
-        # --- Execute the LLM's code in the defined scope ---
         exec(code, {}, local_scope)
-        
-        # Get the processed dataframe back from the scope
         processed_df = local_scope['df']
         log_output = buffer.getvalue()
-        
         print(f"✓ Code executed successfully. New DF shape: {processed_df.shape}")
         log = f"SUCCESS | Output:\n{log_output}"
         
-        # --- MODIFIED: Serialize the *new* DataFrame back to JSON ---
         new_df_json = processed_df.to_json(orient='split')
         
         return {
-            "df_json": new_df_json,  # <--- MODIFIED: Save new JSON to state
+            "df_json": new_df_json,
             "execution_log": state.get("execution_log", []) + [log],
             "error": None,
         }
@@ -216,36 +225,118 @@ def code_execution_node(state: AgentState) -> Dict[str, Any]:
     finally:
         sys.stdout = old_stdout
 
+# --- NEW NODE ---
+def validation_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Node 4: The "Auditor".
+    Compares the processed dataframe against the original user prompt to check if
+    all goals were met.
+    """
+    print("\n--- 🧐 NODE: Validation ---")
+    
+    df_json = state.get("df_json")
+    user_prompt = state.get("user_prompt")
+    
+    if not df_json or not user_prompt:
+        return {"error": "Missing df_json or user_prompt for validation."}
+
+    try:
+        df = pd.read_json(io.StringIO(df_json), orient='split')
+        # Create a concise preview of the *processed* data
+        preview = {
+            'shape': df.shape,
+            'columns': list(df.columns),
+            'head (first 2 rows)': df.head(2).to_dict('records'),
+            'missing_values': df.isnull().sum().to_dict(),
+            'dtypes': {k: str(v) for k, v in df.dtypes.to_dict().items()}, # Make dtypes JSON-safe
+        }
+        
+        system = """
+You are a Data Quality Auditor. You will be given a user's original request
+and a preview of the *final processed dataframe*.
+
+Your sole job is to determine if the final dataframe successfully meets
+all of the user's requirements.
+
+- If YES, return `{"satisfied": true}`.
+- If NO, return `{"satisfied": false, "feedback": "..."}`.
+  The feedback MUST be a concise, actionable instruction for the
+  Data Engineer on what to fix. (e.g., "The 'gross' column was dropped,
+  but the user needed it. Please re-run and ensure 'gross' is retained
+  and cleaned.")
+"""
+        context = f"""
+**Original User Goal:**
+{user_prompt}
+
+**Preview of Final Processed Data:**
+{json.dumps(preview, indent=2)}
+
+Does this data satisfy all requirements of the original user goal?
+"""
+        resp = validation_llm.invoke([SystemMessage(content=system), HumanMessage(content=context)])
+        
+        if resp.satisfied:
+            print("✓ Validation PASSED.")
+            return {"validation_feedback": None} # No feedback, we are done
+        else:
+            print(f"✗ Validation FAILED. Feedback: {resp.feedback}")
+            return {"validation_feedback": resp.feedback}
+            
+    except Exception as e:
+        print(f"✗ Error in Validation Node: {e}")
+        return {"error": f"Validation failed: {e}"}
+
 
 # ----------------------------------------------------------------------
-# 6. Graph Routing (Unchanged)
+# 6. Graph Routing
 # ----------------------------------------------------------------------
 def route_initial(state: AgentState) -> str: 
     if state.get("feedback"):
-        print("--- 🚦 ROUTE: Feedback Loop ---")
+        print("--- 🚦 ROUTE: Manual Feedback Loop ---")
         return "generate_plan"
     if not state.get("analysis_report"):
         print("--- 🚦 ROUTE: New Job ---")
         return "data_preview"
     return "generate_plan"
 
-def should_retry(state: AgentState) -> str:
+# --- RENAMED & MODIFIED ---
+def route_after_execution(state: AgentState) -> str:
+    """
+    Checks for code execution errors.
+    If error, retry plan. If success, go to validation.
+    """
     r = state.get("retries", 0)
     m = state.get("max_retries", 3)
     
     if state.get("error"):
         if r < m:
-            print(f"--- 🚦 ROUTE: Retrying (Attempt {r+1}/{m}) ---")
-            return "generate_plan"
+            print(f"--- 🚦 ROUTE: Retrying Code Error (Attempt {r+1}/{m}) ---")
+            return "generate_plan" # Code error, retry
         else:
             print(f"--- 🚦 ROUTE: Max Retries Reached ---")
-            return END
+            return END # Max retries, give up
             
-    print("--- 🚦 ROUTE: Success ---")
+    print("--- 🚦 ROUTE: Code OK, Proceeding to Validation ---")
+    return "validation_node" # Code ran, now validate logic
+
+# --- NEW ROUTER ---
+def route_after_validation(state: AgentState) -> str:
+    """
+    Checks the result of the validation_node.
+    If feedback exists, loop back to planner. Otherwise, end.
+    """
+    if state.get("validation_feedback"):
+        # We have logical feedback, re-plan
+        print(f"--- 🚦 ROUTE: Validation Failed, Re-planning ---")
+        return "generate_plan"
+    
+    # No feedback, we are done
+    print("--- 🚦 ROUTE: Validation Passed, Success! ---")
     return END
 
 # ----------------------------------------------------------------------
-# 7. Build the Graph (Unchanged)
+# 7. Build the Graph
 # ----------------------------------------------------------------------
 def build_graph(checkpointer):
     print("--- 🏗️ Building Agent Graph ---")
@@ -254,6 +345,7 @@ def build_graph(checkpointer):
     g.add_node("data_preview", data_preview_node)
     g.add_node("generate_plan", plan_generation_node)
     g.add_node("execute_code", code_execution_node)
+    g.add_node("validation_node", validation_node) # <--- ADDED New Node
 
     g.add_conditional_edges(START, route_initial, {
         "data_preview": "data_preview",
@@ -261,7 +353,16 @@ def build_graph(checkpointer):
     })
     g.add_edge("data_preview", "generate_plan")
     g.add_edge("generate_plan", "execute_code")
-    g.add_conditional_edges("execute_code", should_retry, {
+    
+    # --- MODIFIED: Route from execute_code to validation_node ---
+    g.add_conditional_edges("execute_code", route_after_execution, {
+        "generate_plan": "generate_plan",
+        "validation_node": "validation_node", # <--- New path
+        END: END,
+    })
+    
+    # --- NEW: Route from validation_node back to planner or END ---
+    g.add_conditional_edges("validation_node", route_after_validation, {
         "generate_plan": "generate_plan",
         END: END,
     })
@@ -272,7 +373,7 @@ def build_graph(checkpointer):
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     
-    FILE_PATH = r"E:\downloads\archive (18)\laptopData.csv"
+    FILE_PATH = r"E:\downloads\archive (19)\movies.csv"
     USER_PROMPT = """
 Your task is to autonomously clean and prepare this dataset for general analysis.
 
@@ -290,10 +391,10 @@ Your goals are to:
 
 In short: **Act as an expert data engineer, analyze your own report, and clean the data based on your findings.**
 """
-    THREAD_ID = "laptop-json-agent-v1" # New ID
+    THREAD_ID = "Movie-json-agent-v1" # New ID
 
     print("\n" + "="*80)
-    print("🚀 GENAI STATEFUL DATA AGENT (JSON/DB-STATE)")
+    print("🚀 GENAI STATEFUL DATA AGENT (w/ Validation Loop)")
     print(f"   CWD: {os.getcwd()}")
     print("="*80 + "\n")
 
@@ -304,6 +405,7 @@ In short: **Act as an expert data engineer, analyze your own report, and clean t
         inputs = {"file_path": FILE_PATH, "user_prompt": USER_PROMPT}
         config = {"configurable": {"thread_id": THREAD_ID}}
 
+        # --- UPDATED STREAMING LOOP FOR BETTER DEBUGGING ---
         for event in app.stream(inputs, config, stream_mode="updates"):
             node = list(event.keys())[0]
             if node == START or node == "__end__":
@@ -311,17 +413,32 @@ In short: **Act as an expert data engineer, analyze your own report, and clean t
             
             print(f"\n--- STATE UPDATE (from node: {node}) ---")
             
-            # Filter out the 'df_json' key so we don't print a huge string
-            update_keys = [k for k in event[node].keys() if k != 'df_json']
-            print(f"Keys updated: {update_keys}")
+            # Get the dictionary of updates from the node
+            update_data = event[node]
+            
+            # Print all keys *except* the big ones
+            update_keys = [k for k in update_data.keys() if k not in ['df_json', 'execution_log', 'plan']]
+            if update_keys:
+                print(f"Keys updated: {update_keys}")
 
+            # --- THIS IS THE CRITICAL DEBUGGING PART ---
+            # If an error was just added, print it
+            if 'error' in update_data and update_data['error']:
+                print(f"\n!!! ERROR DETECTED: {update_data['error']} !!!")
+            
+            # If the execution_log was just updated (which happens on error or success)
+            # print the *last* log entry.
+            if 'execution_log' in update_data:
+                print("\n--- Execution Log (Last Entry) ---")
+                print(update_data['execution_log'][-1])
+                print("---------------------------------")
+        
         # --- FINAL CHECK (Deserialize from JSON) ---
         print(f"\n" + "="*80)
         print("✅ AGENT RUN COMPLETE. Checking final state...")
         
         final_state = app.get_state(config)
         
-        # --- THIS IS THE FIX ---
         # The state is inside the .values attribute of the snapshot
         final_df_json = final_state.values.get('df_json')
 
@@ -340,7 +457,10 @@ In short: **Act as an expert data engineer, analyze your own report, and clean t
                 print(f"❌ FAIL: Could not deserialize final dataframe from state. Error: {e}")
         else:
             print(f"❌ FAIL: No dataframe (df_json) found in final state.")
-            print("   Check the execution_log in the console above for the error.")
+            # --- ALSO PRINT THE FINAL ERROR LOG IF IT FAILED ---
+            if final_state.values.get('error'):
+                print(f"   Final Error: {final_state.values.get('error')}")
+                print("   See execution log in the console scrollback for details.")
         
         print("="*80)
 
