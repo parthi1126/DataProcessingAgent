@@ -415,9 +415,9 @@ Runs 5 automated end-to-end tests: ingest → summary → analyze → LLM report
 
 ```
   ┌──────────────────────────────────────────────────────┐
-  │  Parthi                                              │
+  │  Parthiban R                                         │
   │  Final Year B.Tech — AI & Data Science               │
-  │  CITAR AIDS | Reg No: 213223243037                   │
+  │  Chennai Institute of Technology
   │                                                      │
   │  Project: Autonomous Data Preprocessing Agent        │
   │  Stack:   LangGraph · Gemini 2.5 Pro · LangChain     │
