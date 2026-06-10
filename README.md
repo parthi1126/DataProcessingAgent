@@ -18,6 +18,7 @@
   ╚═╝     ╚═╝  ╚═╝ ╚═════╝  ╚═════╝╚══════╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚═════╝ 
 ```
 
+### `[ PROJECT ] ──► Data Preprocessing Agent`
 ### `[ MODEL ] ──► Gemini 2.5 Pro`
 ### `[ FRAMEWORK ] ──► LangGraph Stateful Agent`
 ### `[ BACKEND ] ──► LangChain · Pydantic · Pandas · SQLite`
